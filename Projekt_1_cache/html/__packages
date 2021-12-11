@@ -1,0 +1,14 @@
+base
+EDAWR
+dplyr
+tidyverse
+ggplot2
+tibble
+tidyr
+readr
+purrr
+stringr
+forcats
+readxl
+kableExtra
+reactable

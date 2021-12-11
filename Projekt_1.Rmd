@@ -1,0 +1,569 @@
+---
+title: "Analiza danych o dobrobycie w różnych krajach świata"
+author: "Jędrzej Smolarkiewicz"
+date: "11 12 2021"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    theme: flatly
+    fig_caption: yes
+    number_sections: yes
+    keep_md: yes
+    word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE, results = TRUE)
+```
+
+# Ustawienia wstępne
+
+## Wykorzystane biblioteki
+
+```{r libraries}
+library(EDAWR)
+library(dplyr)
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(plotly)
+library(reactable)
+library(caret)
+library(randomForest)
+```
+
+## Zapewnienie powtarzalności obliczeń
+
+```{r seed}
+set.seed(23)
+```
+
+# Wczytanie, czyszczenie i podsumowanie zbiorów
+## World Development Indicators
+### Wczytanie danych
+
+```{r read_file}
+dirty_wdi = read_excel("Data/World_Development_Indicators.xlsx", na="..")
+```
+
+Zbiór zawierał komórki o wartościach '..' nie zawierające danych. Zostały one zastąpione wartościami pustymi na etapie wczytywania.
+
+### Czyszczenie zbioru
+
+Wyodrębnienie wszystkich serii
+```{r}
+series_df <- dirty_wdi %>%
+  distinct(`Series Name`, `Series Code`)
+
+series_df %>%
+  reactable(resizable=TRUE, wrap=FALSE, bordered=TRUE)
+
+```
+
+Utworzenie tabeli zawierającej tylko kraje i ich wskaźniki rozwoju na przestrzeni lat
+```{r}
+country_df <- dirty_wdi %>%
+  gather("Year", "Value", 5:ncol(dirty_wdi)) %>% 
+  select(-c(`Series Code`)) %>%
+  filter(!`Country Name` %in% c("Low & middle income","Low income","Lower middle income","Middle income","Upper middle income","High income"))  %>%
+  mutate(Year = as.numeric(substr(Year, 1, 4)))
+
+country_df %>%
+  head() %>%
+  reactable(resizable=TRUE, wrap=FALSE, bordered=TRUE)
+```
+
+
+```{r, echo=FALSE}
+country_counted <- country_df %>%
+  drop_na() %>%
+  count(`Country Name`, name="Filled") %>%
+  left_join(count(country_df, `Country Name`, name="All"), by="Country Name") %>%
+  mutate("Filled [%]" = as.numeric(round(`Filled`/`All`*100, 0)))
+
+p <- country_counted %>%
+  count(`Wypełnienie [%]` = round(`Filled [%]`, 0 )) %>%
+  rename(Liczba = n) %>%
+  ggplot(aes(x=`Wypełnienie [%]`, y=Liczba)) +
+  geom_col() +
+  labs(y="Ilość krajów", x="Pokrycie danych [%]") +
+  ggtitle('Ilość krajów z poszczególnym pokryciem danych') +
+  theme_minimal()
+
+ggplotly(p)
+```
+
+
+Dla uproszczenia dalszej analizy, odfiltrowano dane tylko do Niemiec, o rozsądnym współczynnik wypełnienia 65%. Wybrano Niemcy, ponieważ posiadają największy % udziału w PKB Unii Europejskiej.
+```{r}
+germany_df <- country_df %>%
+  filter(`Country Name` == 'Germany') %>%
+  select(-c(`Country Name`,`Country Code`))
+
+germany_df %>%
+  head() %>%
+  reactable(resizable=TRUE, wrap=FALSE, bordered=TRUE)
+
+```
+
+
+Utworzenie zbioru danych zawierającego wszystkie wskaźniki dla różnych kategorii zamożności, które zostaną wykorzystane w podsumowaniu
+```{r}
+group_df <- dirty_wdi %>%
+  gather("Year", "Value", 5:ncol(dirty_wdi), na.rm = TRUE) %>% 
+  select(-`Series Name`) %>%
+  filter(`Country Name` %in% c("Low & middle income","Low income","Lower middle income","Middle income","Upper middle income","High income")) %>%
+  mutate(Year = as.numeric(substr(Year, 1, 4)))
+
+group_df %>%
+  head() %>%
+  reactable(resizable=TRUE, wrap=FALSE, bordered=TRUE)
+
+```
+
+### Podsumowanie danych
+Cały zbiór World Development Indicators zawiera dane o `r nrow(series_df)` wskaźnikach rozwoju `r nrow(country_counted)-1` państw od roku `r min(country_df["Year"])` do roku `r max(country_df["Year"])`. Oprócz tego zawiera informacje o kategoriach zamożności, których trendy zostały przedstawione poniżej:
+
+```{r}
+group_df %>%
+  filter(`Series Code` == "NY.GDP.PCAP.CD") %>%
+  ggplot(aes(x=Year, y=Value)) +
+  geom_point() +  
+  geom_smooth(method = "lm") +
+  facet_wrap( ~ `Country Name`) +
+  labs(x="Rok", y="Wartość [USD]") +
+  ggtitle('PKB na mieszkańca') +
+  theme_minimal()
+```
+
+Na podstawie wykresów możemy stwierdzić że wśród krajów niemal każdej z grup widoczna jest tendencja wzrostowa ilości Przychodu Krajowego Brutto na mieszkańca, na przestrzeni danych lat.
+
+## Gold prices
+### Wczytanie zbioru
+Zbiór zawiera informacje o wartości złota wyrażoną w wybranych walutach. Ponieważ w poprzednim zbiorze PKB na mieszkańca był wyrażony w USD, w przypadku wczytywania tego zbioru pozostałe waluty są pomijane.
+```{r}
+dirty_gold <- read.csv("Data/Gold prices.csv", colClasses = c("Date", "numeric", "numeric", rep("NULL", 4)), col.names = c("Date", "AM_USD", "PM_USD", rep("NULL", 4)), header = TRUE)
+
+dirty_gold %>% 
+  head() %>% 
+  reactable(resizable=TRUE, wrap=FALSE, bordered=TRUE)
+```
+### Czyszczenie zbioru danych
+Niektóre rekordy posiadają puste komórki w pierwszej lub drugiej połowie dnia. Zostają zastąpione istniejącą już wartością z danego dnia. Dodatkowo zostaną wszystkie dane zostaną pogrupowane po roku oraz dla każdego roku wyliczona ich średnia.
+```{r}
+dirty_gold <- dirty_gold %>%
+   mutate(AM_USD = coalesce(AM_USD,PM_USD), PM_USD = coalesce(PM_USD,AM_USD))
+
+
+gold_df <- dirty_gold %>%
+  mutate(Year = as.numeric(substr(Date, 1, 4))) %>%
+  group_by(Year) %>% 
+  summarize(USD = (mean(AM_USD) + mean(PM_USD)) / 2)
+
+gold_df %>% 
+  head() %>% 
+  reactable(resizable=TRUE, wrap=FALSE, bordered=TRUE)
+```
+
+### Podsumowanie zbioru
+Zbiór zawiera informacje o średniej cenie złota na przestrzeni lat 1968-2021 wyrażonej w USD
+```{r}
+gold_df %>%
+  ggplot(aes(x=Year, y=USD)) +
+  geom_line() + 
+  geom_point() +
+  geom_smooth(method = "lm") +
+  ylim(0, NA) +
+  labs(x="Rok", y="Wartość złota [USD]") +
+  ggtitle("Wartość złota na przestrzeni lat") +
+  theme_minimal()
+```
+
+Na podstawie powyższego wykresu możemy łatwo stwierdzić że złoto znacznie zwiększyła swoją wartość w USD na przestrzeni lat.
+
+## Currency Exchange Rates
+### Wczytanie danych
+```{r}
+currency_df <- read.csv("Data/CurrencyExchangeRates.csv", colClasses = c("Date", rep("numeric", 51)), header = TRUE, na="")
+
+currency_df %>%
+  head() %>%
+  reactable(resizable=TRUE, wrap=FALSE, bordered=TRUE)
+```
+
+### Czyszczenie danych
+Zbiór przedstawia codzienny kurs wymiany `r ncol(currency_df)-1` walut. Na potrzeby analizy zostaną ograniczone do Chińskich Yuanów, Funtów Brytyjskich, Euro oraz Franków Szwajcarskich. Ponieważ dane są codzienne kursy wymiany walut, zostaną wyliczone średnie dla każdego roku.
+```{r}
+currency_df <- currency_df %>%
+  select(Date, Chinese.Yuan, U.K..Pound.Sterling, Euro, Swiss.Franc) %>%
+  rename(UK.Pound = U.K..Pound.Sterling) %>%
+  mutate(Year = as.numeric(format(Date, "%Y"))) %>%
+  group_by(Year) %>%
+  summarise(Chinese.Yuan = mean(Chinese.Yuan, na.rm = TRUE),
+            UK.Pound = mean(UK.Pound, na.rm=TRUE),
+            Euro = mean(Euro, na.rm=TRUE),
+            Swiss.Franc = mean(Swiss.Franc, na.rm=TRUE))
+```
+
+### Podsumowanie danych
+```{r}
+currency_df %>%
+  rename(Yuan = Chinese.Yuan, Funt = UK.Pound, Frank = Swiss.Franc) %>%
+  gather(Currency, Value, Yuan:Frank) %>%
+  ggplot(aes(x=Year, y=Value)) +
+  geom_point() +
+  facet_wrap( ~ Currency) +
+  labs(x="Rok", y="Kurs na USD") +
+  ggtitle('Kursy wybranych walut na przestrzeni lat') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+```
+
+Na podstawie wykresów możemy zauważyć znaczącą zmianę jedynie w przypadku Chińskich Yuanów. Kurs pozostałych walut na USD pozostaje na podobnym poziomie
+
+## S&P Composites
+### Wczytanie zbioru
+Zbiór zawiera informacje o indeksie S&P (Standard and Poor), czyli powszechne akcje na giełdzie mierzące ogólne wyniki rynku.
+```{r}
+sp_composite_df <- read.csv("Data/S&P Composite.csv", colClasses = c("Date", rep("numeric", 9)), header = TRUE, na="")
+
+sp_composite_df %>% 
+  head() %>% 
+  reactable(resizable=TRUE, wrap=FALSE, bordered=TRUE)
+```
+
+### Czyszczenie zbioru
+Podobnie do zbioru kursów walut, w tym przypadku dane również zostaną pogrupowane po roku oraz zostanie wyliczona ich średnia. Dodatkowo do dalszej analizy odfiltrowane zostają dane sprzed 1995 roku.
+```{r}
+sp_composite_df <- sp_composite_df %>%
+  mutate(Year = as.numeric(format(Year, format="%Y"))) %>%
+  group_by(Year) %>%
+  filter(Year >= 1995) %>%
+  summarise(S.P.Composite = mean(S.P.Composite))
+
+sp_composite_df %>% 
+  head() %>% 
+  reactable(resizable=TRUE, wrap=FALSE, bordered=TRUE)
+
+```
+
+### Podsumowanie danych
+```{r, echo=FALSE}
+sp_composite_df %>%
+  ggplot(aes(x=Year, y=S.P.Composite)) +
+  geom_point() +
+  labs(x="Rok", y="Wartość indeksu") +
+  ggtitle('Wartość indeksu S&P na przestrzeni lat') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+```
+
+# Korelacje
+
+Złączenie uzyskanych zbiorów w jeden
+```{r}
+germany_df <- germany_df %>%
+  spread(`Series Name`, `Value`)
+
+temp_df <- inner_join(germany_df, gold_df) %>%
+  rename(GoldUSD = USD)
+
+temp_df <- inner_join(temp_df, currency_df)
+sum_df <- inner_join(temp_df, sp_composite_df)
+
+sum_df %>%
+  head() %>%
+  reactable(resizable=TRUE, wrap=FALSE, bordered=TRUE)
+
+```
+
+
+Zbiorowa korelacja wszystkich atrybutów
+```{r}
+cor_mat <- cor(
+  x = select(sum_df, -1), 
+  use="pairwise.complete.obs")
+
+
+cor_df = data.frame(cor_mat) %>%
+ rownames_to_column()
+
+cor_df <- cor_df %>%
+ pivot_longer(-rowname, names_to="colname")
+
+cor_df %>%
+  head() %>%
+  reactable(resizable=TRUE, wrap=FALSE, bordered=TRUE)
+
+cor_plot <- ggplot(cor_df, aes(colname, rowname, fill=value)) + 
+  geom_tile() +
+  scale_fill_gradient2() + 
+  theme(axis.text.x = element_blank(), axis.text.y = element_blank())
+
+ggplotly(cor_plot)
+```
+
+Wyodrębnienie bardziej interesujących korelacji jest trudne w tak dużym zbiorze, dlatego ze zbioru WDI pozostaną tylko wybrane atrybuty:
+
+```{r, echo=FALSE}
+filtered_sum_df <- sum_df %>%
+  select(`Year`,
+         `CO2 emissions (metric tons per capita)`, 
+         `Exports of goods and services (current US$)`,
+         `Imports of goods and services (current US$)`,
+         `GDP per capita (current US$)`,
+         `Government expenditure on education, total (% of GDP)`,
+         `Individuals using the Internet (% of population)`,
+         `Life expectancy at birth, total (years)`,
+         `Population, total`,
+         `GoldUSD`,
+         `Chinese.Yuan`,
+         `UK.Pound`,
+         `Euro`,
+         `Swiss.Franc`,
+         `S.P.Composite`)
+
+colnames(filtered_sum_df) <- c('Year',
+                               'CO2.emissions.mt.per.cap', 
+                               'Exports.of.goods.services.USD',
+                               'Imports.of.goods.services.USD',
+                               'GDP.per.capita',
+                               'Gov.expenditure.on.education.USD',
+                               'Individuals.using.Internet',
+                               'Life.expectancy.at.birth',
+                               'Population.total',
+                               'GoldUSD',
+                               'Chinese.Yuan',
+                               'UK.Pound',
+                               'Euro',
+                               'Swiss.Franc',
+                               'S.P.Composite')
+  
+filtered_sum_df %>%
+  head() %>%
+  reactable(resizable=TRUE, wrap=FALSE, bordered=TRUE)
+
+```
+
+Korelacja z mniejszą ilością atrybutów:
+```{r}
+cor_mat2 <- cor(
+  x = select(filtered_sum_df, -1), 
+  use="pairwise.complete.obs")
+
+cor_df2 = data.frame(cor_mat2) %>%
+ rownames_to_column() %>%
+ pivot_longer(-rowname, names_to="colname")
+
+cor_df2 %>%
+  head() %>%
+  reactable(resizable=TRUE, wrap=FALSE, bordered=TRUE)
+
+cor_plot2 <- ggplot(cor_df2, aes(colname, rowname, fill=value)) + 
+  geom_tile() +
+  scale_fill_gradient2() + 
+  theme(axis.text.x = element_text(angle=90, hjust=0))
+
+ggplotly(cor_plot2)
+
+```
+
+Największe korelacje ze współczynnikiem -0.9/0.9 lub większym:
+```{r, echo=FALSE}
+cor_df2 %>% 
+    filter(colname > rowname) %>% 
+    filter(abs(value) >= 0.9) %>%
+    arrange(desc(abs(value))) %>%
+    reactable(resizable=TRUE, wrap=FALSE, bordered=TRUE)
+```
+
+Większość uzyskanych korelacji ma logiczne wytłumaczenie, w miarę rozwoju handlu export oraz import rosną równomiernie, a co za tym idzie społeczeństwo się bogaci, wzrasta również średnia życia. 
+Ciekawą zależnością jest ilość użytkowników internetu do średniej długości życia w momencie urodzenia. Może to wynikać ze zwiększonej świadomości ludzi na temat opieki zdrowotnej. Całkiem odwrotny wpływ na długość życia ma emisja CO2 na mieszkańca.
+Kolejnym interesującym tematem jest zależność kursu walut (Chińskiego Yuana oraz Franka Szwajcarskiego) do kursu złota, PKB na mieszkańca oraz importu/exportu towarów. Jest to najpewniej spowodowane tym, że atrybuty te są wyrażone w walucie USD, a kursy walut również są zależne od USD.
+
+Najmniejsze korelacje:
+```{r, echo=FALSE}
+cor_df2 %>% 
+    filter(colname > rowname) %>%
+    arrange(desc(abs(value))) %>% 
+    tail(10) %>%
+    reactable(resizable=TRUE, wrap=FALSE, bordered=TRUE)
+```
+
+Tutaj możemy zauważyć że % populacji posiadającej dostęp do internetu niemal nie zmienia się wraz z jej wzrostem.
+
+# Animowane wykresy
+```{r, echo=FALSE}
+accumulate_by <- function(dat, var) {
+  var <- lazyeval::f_eval(var, dat)
+  lvls <- plotly:::getLevels(var)
+  dats <- lapply(seq_along(lvls), function(x) {
+    cbind(dat[var %in% lvls[seq(1, x)], ], frame = lvls[[x]])
+  })
+  dplyr::bind_rows(dats)
+}
+```
+
+Wykres populacji kobiet, mężczyzn i całkowitej na świecie na przestrzeni lat
+```{r, echo=FALSE}
+selected_world_pop <- country_df %>%
+  filter(`Country Name` == "World") %>%
+  select(`Country Name`, `Series Name`, `Year`, `Value`) %>%
+  filter(`Series Name` %in% c('Population, total','Population, male','Population, female'))
+
+selected_world_pop <- selected_world_pop %>% accumulate_by(~Year)
+fig <- selected_world_pop %>%
+  plot_ly(
+    x = ~Year, 
+    y = ~Value,
+    split = ~`Series Name`,
+    frame = ~frame, 
+    type = 'scatter',
+    mode = 'lines', 
+    line = list(simplyfy = F)
+  )
+fig <- fig %>% layout(
+  xaxis = list(
+    title = "Year",
+    zeroline = F
+  ),
+  yaxis = list(
+    title = "Population",
+    zeroline = F
+  )
+) 
+fig <- fig %>% animation_opts(
+  frame = 100, 
+  transition = 0, 
+  redraw = FALSE
+)
+fig <- fig %>% animation_slider(
+  hide = T
+)
+fig <- fig %>% animation_button(
+  x = 1, xanchor = "right", y = 0, yanchor = "bottom"
+)
+
+fig
+```
+
+Kolejne wykresy nawiązują już tylko do zredukowanego zbioru z Niemiec.
+Zmiana wartości złota w stosunku do Yuana w kolejnych latach:
+```{r, echo=FALSE}
+
+germany_chart <- filtered_sum_df %>% accumulate_by(~Year)
+fig <- filtered_sum_df %>%
+  plot_ly(
+    x = ~Chinese.Yuan,
+    y = ~GoldUSD,
+    frame = ~Year,
+    type = 'scatter',
+    mode = 'markers',
+    showlegend = F
+  )
+
+fig
+
+```
+
+Zmiana procenta populacji korzystającej z internetu w stosunku do PKB na mieszkańca w kolejnych latach. Rozmiar kropki oznacza średnią długość życia:
+```{r, echo=FALSE}
+
+fig <- filtered_sum_df %>%
+  plot_ly(
+    x = ~GDP.per.capita, 
+    y = ~Individuals.using.Internet, 
+    size = ~Life.expectancy.at.birth, 
+    frame = ~Year, 
+    text = ~Life.expectancy.at.birth, 
+    hoverinfo = "text",
+    type = 'scatter',
+    mode = 'markers',
+    showlegend = F
+  )
+
+fig
+
+```
+
+# Regresor przewidujący cenę złota
+## Podział zbioru
+Niestety wybrany wcześniej atrybut o wydatkach na edukację ma zbyt wiele wartości pustych, dlatego do dalszych obliczeń konieczne jest jego odrzucenie.
+```{r}
+filtered_sum_df <- filtered_sum_df %>%
+  select(-`Gov.expenditure.on.education.USD`)
+```
+
+Pozostaje jeszcze tylko usunięcie wierszy zawierających wartości puste i usunięcie kolumny z rokiem.
+```{r}
+filtered_sum_df <- filtered_sum_df[complete.cases(filtered_sum_df), ]
+
+prediction_df <- filtered_sum_df %>%
+  select(-`Year`)
+
+inTraining  <- createDataPartition( y = prediction_df$GoldUSD, p=0.7, list=F)
+training <- prediction_df[ inTraining,]
+testing <- prediction_df[-inTraining,]
+```
+
+
+## Uczenie
+```{r}
+ctrl <- trainControl(
+    method = "repeatedcv",
+    number = 2,
+    repeats = 5)
+
+```
+
+
+```{r}
+fit <- train(
+  GoldUSD ~ .,
+  data = training,
+  method = "rf",
+  trControl = ctrl,
+  ntree = 30
+)
+fit
+```
+
+## Predykcja
+```{r}
+prediction <- predict(fit, newdata=testing)
+prediction
+
+```
+
+
+## Wyniki
+```{r, echo=FALSE}
+results_df <- testing %>% 
+  inner_join(filtered_sum_df, by="GoldUSD") %>%
+  select(Year, GoldUSD) %>%
+  rename(Real = GoldUSD)
+
+results_df$Predicted <- prediction
+
+results_df <- results_df %>% pivot_longer(-`Year`, names_to='Type', values_to='Values')
+
+ggplot(results_df, aes(x=Year, y=Values)) + 
+  geom_line() +
+  facet_wrap( ~ Type) +
+  labs(x = "Rok", y = "Wartość złota [USD]") +
+  theme_minimal()
+```
+
+Udało się w zadowalający sposób zaestymować cenę złota na podstawie danych atrybutów.
+
+# Analiza ważności atrybutów
+
+```{r}
+gbmImp <- varImp(fit, scale = FALSE)
+plot(gbmImp)
+```
+
+Co zaskakujące okazuje się, że najważniejszym atrybutem jest średnia długość życia w momencie narodzin. 
+Niemal o połowę mniejszą ważność ma procent ludności używający internetu, a dopiero kolejnymi czynnikami są handel, emisja CO2, Yuan czy też PKB na mieszkańca.
+
